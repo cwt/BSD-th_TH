@@ -87,7 +87,7 @@ def fetch_cldr():
 
     dp = cal["dayPeriods"]["format"]
     am_pm = ("AM", "PM")
-    for style in ("wide", "abbreviated"):
+    for style in ("abbreviated", "wide"):
         if style in dp and "am" in dp[style]:
             am_pm = (dp[style]["am"], dp[style]["pm"])
             break
