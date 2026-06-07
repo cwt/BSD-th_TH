@@ -64,20 +64,38 @@ Requirements
 ------------
 
 - Python 3.8+
-- Internet connection (fetches CLDR JSON and ISO 14651 CTT on first run)
+- Internet connection (fetches CLDR JSON and ISO 14651 CTT on first run; cached for 30 days)
 - `sudo` access for installation
 
 
 Usage
 -----
 
-    sudo python3 th_locale.py
+    sudo python3 th_locale.py [options]
 
-This will:
+Options:
 
-1. Fetch Thai locale data from Unicode CLDR
+| Option          | Description                              |
+|-----------------|------------------------------------------|
+| `--dry-run`     | Generate locale files but don't install  |
+| `--verify-only` | Only verify existing installation        |
+| `--force`       | Force re-download (ignore cache)         |
+| `--verbose`     | Enable verbose output                    |
+| `--help`        | Show help message                        |
+
+Examples:
+
+    sudo python3 th_locale.py              # Install locale (uses cache)
+    sudo python3 th_locale.py --dry-run    # Generate files only (th_TH.src, iso14651_t1.src)
+    sudo python3 th_locale.py --force      # Force re-download and regenerate
+    python3 th_locale.py --verify-only     # Verify existing install
+    python3 th_locale.py --verbose         # Verbose output
+
+What happens on install:
+
+1. Fetch Thai locale data from Unicode CLDR (Gregorian + Buddhist calendar)
 2. Fetch the ISO/IEC 14651 Common Template Table for collation
-3. Save a POSIX locale definition as `th_TH.src` (and `iso14651_t1.src`)
+3. Save POSIX locale definition as `th_TH.src` (and `iso14651_t1.src`)
 4. Install the locale (platform-specific method)
 5. Verify it works
 
@@ -95,7 +113,9 @@ Verify from Python:
     python3 -c "
     import locale
     locale.setlocale(locale.LC_ALL, 'th_TH.UTF-8')
-    print(locale.nl_langinfo(locale.MON_1))  # มกราคม
+    print(locale.nl_langinfo(locale.MON_1))   # มกราคม
+    print(locale.nl_langinfo(locale.DAY_1))   # วันอาทิตย์
+    print(locale.nl_langinfo(locale.CRNCYSTR)) # ฿
     "
 
 
@@ -108,17 +128,49 @@ Generated files
 | `th_TH.src`        | POSIX locale source (for inspection / BSD localedef)  |
 | `iso14651_t1.src`  | ISO/IEC 14651 Common Template Table (BSD LC_COLLATE)  |
 
+Cache
+-----
+
+Downloaded data is cached in `~/.cache/th_locale/` for 30 days:
+
+- `ca-gregorian.json` — CLDR Gregorian calendar data
+- `ca-buddhist.json` — CLDR Buddhist calendar data (fallback to Gregorian)
+- `ISO14651_2020_TABLE1_en.txt` — ISO 14651 Common Template Table
+
+Use `--force` to bypass cache and re-download.
+
+Test suite
+----------
+
+Run the test suite:
+
+    python3 test_locale.py
+
+Tests cover:
+- Monetary/numeric values
+- Cache functions
+- ISO 14651 CTT processing
+- CLDR data fetching
+- POSIX source generation
+- macOS compiled format generation
+- CLI argument parsing
+- `--dry-run` and `--verify-only` modes
+
 
 How it works
 ------------
 
-The Thai GLibc locale source (`th_TH` from `bminor/glibc`) is GPL-licensed.
+The Thai GLibc locale source (`th_TH` from [glibc](https://sourceware.org/git/gitweb.cgi?p=glibc.git)) is GPL-licensed.
 This project avoids GPL code entirely by sourcing all locale data from the
 Unicode CLDR (Unicode License), and the format/structuring code in
 `th_locale.py` is original.
 
 Month names, day names, and AM/PM strings are parsed from
 [CLDR JSON](https://github.com/unicode-org/cldr-json).
+
+**Buddhist calendar** (พ.ศ. / BE) is also included in LC_TIME:
+- Same month/day names as Gregorian (standard Thai practice)
+- Era name: `พ.ศ.` (Buddhist Era = Gregorian year + 543)
 
 Monetary values (currency symbol, grouping rules, sign position) and numeric
 formatting (decimal/group separators) are standard factual data for the Thai

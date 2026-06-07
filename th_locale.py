@@ -13,9 +13,14 @@ LC_COLLATE is sourced from the ISO/IEC 14651 Common Template Table
 for standard electronic inserts).
 
 Usage:
-    sudo python3 th_locale.py
-    export LC_ALL=th_TH.UTF-8
-    cal
+    sudo python3 th_locale.py [options]
+
+Options:
+    --dry-run       Generate locale files but don't install
+    --verify-only   Only verify existing installation
+    --force         Force re-download and re-generate (ignore cache)
+    --verbose       Enable verbose output
+    --help          Show this help message
 """
 
 import os
@@ -24,12 +29,66 @@ import json
 import shutil
 import subprocess
 import urllib.request
+import argparse
+import hashlib
 from pathlib import Path
+from datetime import datetime, timedelta
 
 CLDR_BASE = "https://raw.githubusercontent.com/unicode-org/cldr-json/main/cldr-json"
 ISO_CTT_URL = "https://standards.iso.org/iso-iec/14651/ed-6/en/ISO14651_2020_TABLE1_en.txt"
 SRC_DIR = Path("/usr/share/locale")
 MACOS_DST = Path("/usr/local/share/locale") / "th_TH.UTF-8"
+CACHE_DIR = Path.home() / ".cache" / "th_locale"
+CACHE_TTL_DAYS = 30
+
+# -- Cache utilities
+
+def cache_dir():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR
+
+
+def cache_path(url):
+    h = hashlib.sha256(url.encode()).hexdigest()[:16]
+    ext = Path(url).suffix or ".txt"
+    return cache_dir() / f"{h}{ext}"
+
+
+def cache_meta_path(url):
+    h = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return cache_dir() / f"{h}.meta"
+
+
+def is_cache_valid(url, force=False):
+    if force:
+        return False
+    meta = cache_meta_path(url)
+    if not meta.exists():
+        return False
+    try:
+        cached_time = datetime.fromisoformat(meta.read_text().strip())
+        return datetime.now() - cached_time < timedelta(days=CACHE_TTL_DAYS)
+    except Exception:
+        return False
+
+
+def save_to_cache(url, data, verbose=False):
+    path = cache_path(url)
+    meta = cache_meta_path(url)
+    path.write_bytes(data) if isinstance(data, bytes) else path.write_text(data, encoding="utf-8")
+    meta.write_text(datetime.now().isoformat())
+    if verbose:
+        print(f"  cached to {path}")
+
+
+def load_from_cache(url, verbose=False):
+    path = cache_path(url)
+    if verbose:
+        print(f"  using cache: {path}")
+    if path.suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    return path.read_bytes()
+
 
 # -- Thai locale data (factual, no single "owner")
 
@@ -65,15 +124,21 @@ TH_MESSAGES = {
 
 # -- CLDR fetch
 
-def fetch_json(url):
-    print(f"* fetching {url.split('/')[-1]} from CLDR...")
+def fetch_json(url, force=False, verbose=False):
+    if is_cache_valid(url, force):
+        return load_from_cache(url, verbose)
+    if verbose:
+        print(f"* fetching {url.split('/')[-1]} from CLDR...")
     with urllib.request.urlopen(url, timeout=15) as resp:
-        return json.loads(resp.read())
+        data = resp.read()
+    text = data.decode("utf-8")
+    save_to_cache(url, text, verbose)
+    return json.loads(text)
 
 
-def fetch_cldr():
+def fetch_cldr(force=False, verbose=False):
     url = f"{CLDR_BASE}/cldr-dates-full/main/th/ca-gregorian.json"
-    data = fetch_json(url)
+    data = fetch_json(url, force, verbose)
     cal = data["main"]["th"]["dates"]["calendars"]["gregorian"]
 
     months = cal["months"]["format"]
@@ -92,7 +157,17 @@ def fetch_cldr():
             am_pm = (dp[style]["am"], dp[style]["pm"])
             break
 
-    return abmon, mon, abday, day, am_pm
+    # Buddhist calendar uses same month/day names as Gregorian in Thailand
+    # Buddhist era = Gregorian year + 543
+    buddhist_abmon = abmon
+    buddhist_mon = mon
+    buddhist_abday = abday
+    buddhist_day = day
+    buddhist_am_pm = am_pm
+    buddhist_era = "พ.ศ."
+
+    return (abmon, mon, abday, day, am_pm,
+            buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era)
 
 
 # -- ISO 14651 Common Template Table (LC_COLLATE)
@@ -105,12 +180,19 @@ CTT_ACTIVATE = {
 }
 
 
-def fetch_iso_ctt():
-    print(f"* fetching ISO 14651 Common Template Table (Unicode 13.0)...")
+def fetch_iso_ctt(force=False, verbose=False):
+    if is_cache_valid(ISO_CTT_URL, force):
+        if verbose:
+            print("* using cached ISO 14651 Common Template Table")
+        return load_from_cache(ISO_CTT_URL, verbose).decode("utf-8")
+    if verbose:
+        print(f"* fetching ISO 14651 Common Template Table...")
     with urllib.request.urlopen(ISO_CTT_URL, timeout=60) as resp:
         data = resp.read()
     text = data.decode("utf-8")
-    print(f"  downloaded {len(data) / 1024:.0f} KB")
+    if verbose:
+        print(f"  downloaded {len(data) / 1024:.0f} KB")
+    save_to_cache(ISO_CTT_URL, data, verbose)
     return text
 
 
@@ -133,7 +215,7 @@ def save_iso_ctt(processed):
     return path
 
 
-def compile_iso_ctt():
+def compile_iso_ctt(verbose=False):
     src = Path("iso14651_t1.src")
     if not src.exists():
         print("  ERROR: iso14651_t1.src not found; run fetch first")
@@ -145,14 +227,17 @@ def compile_iso_ctt():
     # macOS localedef is ancient — no collating-element or range support.
     # Strip quarantine attr first (macOS blocks localedef on quarantined files).
     if sys.platform == "darwin":
-        subprocess.run(["xattr", "-d", "com.apple.provenance", str(src)],
-                       capture_output=True)
+        result = subprocess.run(["xattr", "-d", "com.apple.provenance", str(src)],
+                                capture_output=True, text=True)
+        if result.returncode != 0 and verbose:
+            print(f"  xattr warning: {result.stderr.strip()}")
 
     outdir = Path("iso14651_t1")
     if outdir.exists():
         shutil.rmtree(outdir)
     cmd = ["localedef", "-u", "UTF-8", "-i", str(src), "iso14651_t1"]
-    print(f"* running: {' '.join(cmd)}")
+    if verbose:
+        print(f"* running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         if sys.platform == "darwin":
@@ -164,7 +249,8 @@ def compile_iso_ctt():
         return None
     collate_file = outdir / "LC_COLLATE"
     if collate_file.exists():
-        print(f"  compiled LC_COLLATE ({collate_file.stat().st_size} bytes)")
+        if verbose:
+            print(f"  compiled LC_COLLATE ({collate_file.stat().st_size} bytes)")
         return collate_file
     return None
 
@@ -179,7 +265,8 @@ def qjoin(vals):
     return ";".join(q(v) for v in vals)
 
 
-def posix_time(abmon, mon, abday, day, am_pm):
+def posix_time(abmon, mon, abday, day, am_pm,
+                buddhist_abmon=None, buddhist_mon=None, buddhist_abday=None, buddhist_day=None, buddhist_am_pm=None, buddhist_era=None):
     lines = [
         f"abday   {qjoin(abday)}",
         f"day     {qjoin(day)}",
@@ -190,6 +277,15 @@ def posix_time(abmon, mon, abday, day, am_pm):
         't_fmt   "%H:%M:%S"',
         f"am_pm   {qjoin(list(am_pm))}",
     ]
+    if buddhist_abmon:
+        lines.extend([
+            f"abmon_buddhist   {qjoin(buddhist_abmon)}",
+            f"mon_buddhist     {qjoin(buddhist_mon)}",
+            f"abday_buddhist   {qjoin(buddhist_abday)}",
+            f"day_buddhist     {qjoin(buddhist_day)}",
+            f"am_pm_buddhist   {qjoin(list(buddhist_am_pm))}",
+            f"era_buddhist     \"{buddhist_era}\"",
+        ])
     return "\n".join(lines)
 
 
@@ -220,7 +316,8 @@ def posix_messages():
            f'noexpr  "{TH_MESSAGES["noexpr"]}"'
 
 
-def gen_posix_source(abmon, mon, abday, day, am_pm):
+def gen_posix_source(abmon, mon, abday, day, am_pm,
+                     buddhist_abmon=None, buddhist_mon=None, buddhist_abday=None, buddhist_day=None, buddhist_am_pm=None, buddhist_era=None):
     return f"""comment_char %
 escape_char /
 
@@ -233,7 +330,8 @@ LC_NUMERIC
 END LC_NUMERIC
 
 LC_TIME
-{posix_time(abmon, mon, abday, day, am_pm)}
+{posix_time(abmon, mon, abday, day, am_pm,
+            buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era)}
 END LC_TIME
 
 LC_MESSAGES
@@ -443,7 +541,8 @@ def apple_numeric():
     ]) + "\n"
 
 
-def apple_time(abmon, mon, abday, day, am_pm):
+def apple_time(abmon, mon, abday, day, am_pm,
+               buddhist_abmon=None, buddhist_mon=None, buddhist_abday=None, buddhist_day=None, buddhist_am_pm=None, buddhist_era=None):
     parts = []
     parts.extend(abmon)
     parts.extend(mon)
@@ -458,6 +557,14 @@ def apple_time(abmon, mon, abday, day, am_pm):
     parts.extend(mon)
     parts.append("md")
     parts.append("%I:%M:%S %p")
+    if buddhist_abmon:
+        parts.extend(buddhist_abmon)
+        parts.extend(buddhist_mon)
+        parts.extend(buddhist_abday)
+        parts.extend(buddhist_day)
+        parts.append(buddhist_am_pm[0])
+        parts.append(buddhist_am_pm[1])
+        parts.append(buddhist_era)
     return "\n".join(parts) + "\n"
 
 
@@ -467,32 +574,41 @@ def apple_messages():
             f"yes:y:YES:Y\nno:n:NO:N\n")
 
 
-def gen_macos_compiled(abmon, mon, abday, day, am_pm):
+def gen_macos_compiled(abmon, mon, abday, day, am_pm,
+                       buddhist_abmon=None, buddhist_mon=None, buddhist_abday=None, buddhist_day=None, buddhist_am_pm=None, buddhist_era=None):
     return {
         "LC_MONETARY": apple_monetary(),
         "LC_NUMERIC": apple_numeric(),
-        "LC_TIME": apple_time(abmon, mon, abday, day, am_pm),
+        "LC_TIME": apple_time(abmon, mon, abday, day, am_pm,
+                              buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era),
         "LC_MESSAGES/LC_MESSAGES": apple_messages(),
     }
 
 
 # -- Installers
 
-def install_macos(compiled):
+def install_macos(compiled, verbose=False):
     if MACOS_DST.exists():
+        if verbose:
+            print(f"  removing existing {MACOS_DST}")
         subprocess.run(["sudo", "rm", "-rf", str(MACOS_DST)], capture_output=True, check=True)
 
+    if verbose:
+        print(f"  creating {MACOS_DST}/LC_MESSAGES")
     subprocess.run(["sudo", "mkdir", "-p", str(MACOS_DST / "LC_MESSAGES")], capture_output=True, check=True)
     subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(MACOS_DST)],
                    capture_output=True)
 
     for name, data in compiled.items():
         (MACOS_DST / name).write_text(data, encoding="utf-8")
+        if verbose:
+            print(f"  wrote {name}")
 
     collate_bin = gen_macos_collate()
     (MACOS_DST / "LC_COLLATE").write_bytes(collate_bin)
     collate_size = len(collate_bin)
-    print(f"  generated LC_COLLATE ({collate_size} bytes)")
+    if verbose:
+        print(f"  generated LC_COLLATE ({collate_size} bytes)")
 
     ctype = SRC_DIR / "C.UTF-8" / "LC_CTYPE"
     (MACOS_DST / "LC_CTYPE").symlink_to(os.fsdecode(ctype))
@@ -500,7 +616,7 @@ def install_macos(compiled):
     print(f"  installed to {MACOS_DST}")
 
 
-def install_bsd(src_path, ctt_collate):
+def install_bsd(src_path, ctt_collate, verbose=False):
     if not shutil.which("localedef"):
         print("  ERROR: localedef not found on this system")
         print(f"  POSIX source saved to {src_path}")
@@ -508,16 +624,76 @@ def install_bsd(src_path, ctt_collate):
         sys.exit(1)
 
     cmd = ["localedef", "-u", "UTF-8", "-i", str(src_path), "th_TH.UTF-8"]
-    print(f"* running: {' '.join(cmd)}")
-
+    if verbose:
+        print(f"* running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  ERROR: localedef failed:\n  {result.stderr.strip()}")
         sys.exit(1)
-    print("  done")
+    if verbose:
+        print("  done")
 
 
-def verify(ctt_ok):
+def verify(ctt_ok, verbose=False):
+    env = {**os.environ, "LC_ALL": "th_TH.UTF-8"}
+    code = """
+import locale
+locale.setlocale(locale.LC_ALL, 'th_TH.UTF-8')
+print('MON_1:  ', locale.nl_langinfo(locale.MON_1))
+print('DAY_1:  ', locale.nl_langinfo(locale.DAY_1))
+print('ABMON_1:', locale.nl_langinfo(locale.ABMON_1))
+print('CRNCY:  ', locale.nl_langinfo(locale.CRNCYSTR))
+"""
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, env=env)
+    if proc.returncode == 0:
+        if verbose:
+            print(proc.stdout, end="")
+        if ctt_ok:
+            print("  LC_COLLATE: ISO 14651 (proper Thai collation)  ✅")
+        else:
+            print("  LC_COLLATE: system default (basic Unicode order)  ⚠️")
+        return True
+    if verbose:
+        print("verify failed:", proc.stderr.strip())
+    else:
+        print("  Verification failed (use --verbose for details)")
+    return False
+
+
+def save_source(posix_source):
+    path = Path("th_TH.src")
+    path.write_text(posix_source, encoding="utf-8")
+    print(f"* saved {path}")
+    return path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate and install th_TH.UTF-8 locale on BSD and macOS",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo python3 th_locale.py              # Install locale
+  sudo python3 th_locale.py --dry-run    # Generate files only
+  python3 th_locale.py --verify-only     # Verify existing install
+  sudo python3 th_locale.py --force      # Force re-download
+  python3 th_locale.py --help            # Show this help
+"""
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Generate locale files but don't install")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="Only verify existing installation")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-download and re-generate (ignore cache)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose output")
+    return parser.parse_args()
+
+
+def verify_only(verbose=False):
+    print("== Verifying th_TH.UTF-8 locale ==\n")
     env = {**os.environ, "LC_ALL": "th_TH.UTF-8"}
     code = """
 import locale
@@ -531,51 +707,60 @@ print('CRNCY:  ', locale.nl_langinfo(locale.CRNCYSTR))
                           capture_output=True, text=True, env=env)
     if proc.returncode == 0:
         print(proc.stdout, end="")
-        if ctt_ok:
-            print("  LC_COLLATE: ISO 14651 (proper Thai collation)  ✅")
-        else:
-            print("  LC_COLLATE: system default (basic Unicode order)  ⚠️")
+        print("  Locale verified successfully  ✅")
         return True
-    print("verify failed:", proc.stderr)
+    print("  Verification failed:", proc.stderr.strip())
     return False
 
 
-def save_source(posix_source):
-    path = Path("th_TH.src")
-    path.write_text(posix_source, encoding="utf-8")
-    print(f"* saved {path}")
-    return path
-
-
 def main():
+    args = parse_args()
+    verbose = args.verbose
+
+    if args.verify_only:
+        if verify_only(verbose):
+            print("OK")
+        else:
+            sys.exit(1)
+        return
+
     print("== th_TH.UTF-8 locale generator ==\n")
 
-    abmon, mon, abday, day, am_pm = fetch_cldr()
+    cldr_data = fetch_cldr(args.force, verbose)
+    abmon, mon, abday, day, am_pm = cldr_data[:5]
+    buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era = cldr_data[5:]
 
     platform = sys.platform
     print(f"* platform: {platform}")
 
     if platform == "darwin":
-        compiled = gen_macos_compiled(abmon, mon, abday, day, am_pm)
-        install_macos(compiled)
+        compiled = gen_macos_compiled(abmon, mon, abday, day, am_pm,
+                                      buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era)
+        if not args.dry_run:
+            install_macos(compiled, verbose)
         ctt_ok = True
     else:
         print()
-        raw_ctt = fetch_iso_ctt()
+        raw_ctt = fetch_iso_ctt(args.force, verbose)
         processed_ctt = process_iso_ctt(raw_ctt)
         save_iso_ctt(processed_ctt)
-        ctt_collate = compile_iso_ctt()
+        ctt_collate = compile_iso_ctt(verbose)
 
-        posix_source = gen_posix_source(abmon, mon, abday, day, am_pm)
+        posix_source = gen_posix_source(abmon, mon, abday, day, am_pm,
+                                        buddhist_abmon, buddhist_mon, buddhist_abday, buddhist_day, buddhist_am_pm, buddhist_era)
         src_path = save_source(posix_source)
-        install_bsd(src_path, ctt_collate)
+        if not args.dry_run:
+            install_bsd(src_path, ctt_collate, verbose)
         ctt_ok = ctt_collate is not None
 
     print()
-    if verify(ctt_ok):
-        print("OK. Usage: export LC_ALL=th_TH.UTF-8")
+    if not args.dry_run:
+        if verify(ctt_ok, verbose):
+            print("OK. Usage: export LC_ALL=th_TH.UTF-8")
+        else:
+            sys.exit(1)
     else:
-        sys.exit(1)
+        print("Dry run complete. Files generated but not installed.")
 
 
 if __name__ == "__main__":
